@@ -40,7 +40,7 @@ fn main() {
     // mangling names though we assume that we're also in test mode so we don't
     // build anything and we rely on the upstream implementation of compiler-rt
     // functions
-    if !cfg!(feature = "mangled-names") && cfg!(feature = "c") {
+    if !cfg!(feature = "mangled-names") && cfg!(any(feature = "c-vendor", feature = "c-system")) {
         // Don't use a C compiler for these targets:
         //
         // * wasm32 - clang 8 for wasm is somewhat hard to come by and it's
@@ -50,8 +50,10 @@ fn main() {
         //   compiler nor is cc-rs ready for compilation to riscv (at this
         //   time). This can probably be removed in the future
         if !target.contains("wasm32") && !target.contains("nvptx") && !target.starts_with("riscv") {
-            #[cfg(feature = "c")]
-            c::compile(&llvm_target);
+            #[cfg(feature = "c-vendor")]
+            c_vendor::compile(&llvm_target);
+            #[cfg(feature = "c-system")]
+            c_system::compile(&llvm_target);
         }
     }
 
@@ -73,17 +75,14 @@ fn main() {
     }
 }
 
-#[cfg(feature = "c")]
-mod c {
-    extern crate cc;
-
+#[cfg(any(feature = "c-vendor", feature = "c-system"))]
+mod sources {
     use std::collections::BTreeMap;
     use std::env;
-    use std::path::PathBuf;
 
-    struct Sources {
+    pub struct Sources {
         // SYMBOL -> PATH TO SOURCE
-        map: BTreeMap<&'static str, &'static str>,
+        pub map: BTreeMap<&'static str, &'static str>,
     }
 
     impl Sources {
@@ -120,39 +119,11 @@ mod c {
         }
     }
 
-    /// Compile intrinsics from the compiler-rt C source code
-    pub fn compile(llvm_target: &[&str]) {
+    pub fn get_sources(llvm_target: &[&str]) -> Sources {
         let target_arch = env::var("CARGO_CFG_TARGET_ARCH").unwrap();
         let target_env = env::var("CARGO_CFG_TARGET_ENV").unwrap();
         let target_os = env::var("CARGO_CFG_TARGET_OS").unwrap();
         let target_vendor = env::var("CARGO_CFG_TARGET_VENDOR").unwrap();
-        let cfg = &mut cc::Build::new();
-
-        cfg.warnings(false);
-
-        if target_env == "msvc" {
-            // Don't pull in extra libraries on MSVC
-            cfg.flag("/Zl");
-
-            // Emulate C99 and C++11's __func__ for MSVC prior to 2013 CTP
-            cfg.define("__func__", Some("__FUNCTION__"));
-        } else {
-            // Turn off various features of gcc and such, mostly copying
-            // compiler-rt's build system already
-            cfg.flag("-fno-builtin");
-            cfg.flag("-fvisibility=hidden");
-            cfg.flag("-ffreestanding");
-            // Avoid the following warning appearing once **per file**:
-            // clang: warning: optimization flag '-fomit-frame-pointer' is not supported for target 'armv7' [-Wignored-optimization-argument]
-            //
-            // Note that compiler-rt's build system also checks
-            //
-            // `check_cxx_compiler_flag(-fomit-frame-pointer COMPILER_RT_HAS_FOMIT_FRAME_POINTER_FLAG)`
-            //
-            // in https://github.com/rust-lang/compiler-rt/blob/c8fbcb3/cmake/config-ix.cmake#L19.
-            cfg.flag_if_supported("-fomit-frame-pointer");
-            cfg.define("VISIBILITY_HIDDEN", None);
-        }
 
         let mut sources = Sources::new();
         sources.extend(&[
@@ -414,6 +385,48 @@ mod c {
             sources.remove(&["__aeabi_cdcmp", "__aeabi_cfcmp"]);
         }
 
+        sources
+    }
+}
+
+#[cfg(feature = "c-vendor")]
+mod c_vendor {
+    extern crate cc;
+
+    use sources;
+    use std::env;
+    use std::path::PathBuf;
+
+    /// Compile intrinsics from the compiler-rt C source code
+    pub fn compile(llvm_target: &[&str]) {
+        let target_env = env::var("CARGO_CFG_TARGET_ENV").unwrap();
+        let cfg = &mut cc::Build::new();
+        cfg.warnings(false);
+
+        if target_env == "msvc" {
+            // Don't pull in extra libraries on MSVC
+            cfg.flag("/Zl");
+
+            // Emulate C99 and C++11's __func__ for MSVC prior to 2013 CTP
+            cfg.define("__func__", Some("__FUNCTION__"));
+        } else {
+            // Turn off various features of gcc and such, mostly copying
+            // compiler-rt's build system already
+            cfg.flag("-fno-builtin");
+            cfg.flag("-fvisibility=hidden");
+            cfg.flag("-ffreestanding");
+            // Avoid the following warning appearing once **per file**:
+            // clang: warning: optimization flag '-fomit-frame-pointer' is not supported for target 'armv7' [-Wignored-optimization-argument]
+            //
+            // Note that compiler-rt's build system also checks
+            //
+            // `check_cxx_compiler_flag(-fomit-frame-pointer COMPILER_RT_HAS_FOMIT_FRAME_POINTER_FLAG)`
+            //
+            // in https://github.com/rust-lang/compiler-rt/blob/c8fbcb3/cmake/config-ix.cmake#L19.
+            cfg.flag_if_supported("-fomit-frame-pointer");
+            cfg.define("VISIBILITY_HIDDEN", None);
+        }
+
         // When compiling the C code we require the user to tell us where the
         // source code is, and this is largely done so when we're compiling as
         // part of rust-lang/rust we can use the same llvm-project repository as
@@ -431,6 +444,7 @@ mod c {
         // use of that macro in lib/builtins/int_util.h in compiler-rt.
         cfg.flag_if_supported(&format!("-ffile-prefix-map={}=.", root.display()));
 
+        let sources = sources::get_sources(llvm_target);
         let src_dir = root.join("lib/builtins");
         for (sym, src) in sources.map.iter() {
             let src = src_dir.join(src);
@@ -440,5 +454,168 @@ mod c {
         }
 
         cfg.compile("libcompiler-rt.a");
+    }
+}
+
+#[cfg(feature = "c-system")]
+mod c_system {
+    extern crate ar;
+
+    use std::collections::HashMap;
+    use std::env;
+    use std::fs::File;
+    use std::path::{Path, PathBuf};
+    use std::process::{Command, Output};
+    use std::str;
+
+    use sources;
+
+    fn success_output(err: &str, cmd: &mut Command) -> Output {
+        let output = cmd.output().expect(err);
+        let status = output.status;
+        if !status.success() {
+            panic!("{}: {:?}", err, status.code());
+        }
+        output
+    }
+
+    // This can be obtained by adding the line:
+    //   message(STATUS "All builtin supported architectures: ${ALL_BUILTIN_SUPPORTED_ARCH}")
+    // to the bottom of compiler-rt/cmake/builtin-config-ix.cmake, then running
+    // cmake and looking at the output.
+    const ALL_SUPPORTED_ARCHES : &'static str = "i386;x86_64;arm;armhf;armv6m;armv7m;armv7em;armv7;armv7s;armv7k;aarch64;hexagon;mips;mipsel;mips64;mips64el;powerpc64;powerpc64le;riscv32;riscv64;wasm32;wasm64";
+
+    // This function recreates the logic of getArchNameForCompilerRTLib,
+    // defined in clang/lib/Driver/ToolChain.cpp.
+    fn get_arch_name_for_compiler_rtlib() -> String {
+        let target = env::var("TARGET").unwrap();
+        let target_arch = env::var("CARGO_CFG_TARGET_ARCH").unwrap();
+        let target_os = env::var("CARGO_CFG_TARGET_OS").unwrap();
+        let r = match target_arch.as_str() {
+            "arm" => {
+                if target.ends_with("eabihf") && target_os != "windows" {
+                    "armhf"
+                } else {
+                    "arm"
+                }
+            }
+            "x86" => {
+                if target_os == "android" {
+                    "i686"
+                } else {
+                    "i386"
+                }
+            }
+            _ => target_arch.as_str(),
+        };
+        r.to_string()
+    }
+
+    fn find_library<I>(dirs: I, libname: &str) -> Result<PathBuf, Vec<String>>
+    where
+        I: Iterator<Item = PathBuf>,
+    {
+        let mut paths = Vec::new();
+        for dir in dirs {
+            let try_path = dir.join(format!("lib{}.a", libname));
+            if try_path.exists() {
+                return Ok(try_path.to_path_buf());
+            } else {
+                paths.push(format!("{:?}", try_path))
+            }
+        }
+        Err(paths)
+    }
+
+    /// Link against system clang runtime libraries
+    pub fn compile(llvm_target: &[&str]) {
+        let target = env::var("TARGET").unwrap();
+        let target_os = env::var("CARGO_CFG_TARGET_OS").unwrap();
+        let compiler_rt_arch = get_arch_name_for_compiler_rtlib();
+        let out_dir = env::var("OUT_DIR").unwrap();
+
+        if ALL_SUPPORTED_ARCHES
+            .split(";")
+            .find(|x| *x == compiler_rt_arch)
+            == None
+        {
+            return;
+        }
+
+        println!("cargo:rerun-if-env-changed=CLANG");
+        println!("cargo:rerun-if-env-changed=LLVM_CONFIG");
+
+        let fullpath = if let Ok(clang) = env::var("CLANG") {
+            let output = success_output(
+                "failed to find clang's compiler-rt",
+                Command::new(clang)
+                    .arg(format!("--target={}", target))
+                    .arg("--rtlib=compiler-rt")
+                    .arg("--print-libgcc-file-name"),
+            );
+            let path = str::from_utf8(&output.stdout).unwrap().trim_end();
+            Path::new(path).to_path_buf()
+        } else if let Ok(llvm_config) = env::var("LLVM_CONFIG") {
+            // fallback if clang is not installed
+            let (subpath, libname) = match target_os.as_str() {
+                "linux" => ("linux", format!("clang_rt.builtins-{}", &compiler_rt_arch)),
+                "macos" => ("darwin", "clang_rt.builtins_osx_dynamic".to_string()),
+                _ => panic!("unsupported target os: {}", target_os),
+            };
+            let output = success_output(
+                "failed to find llvm-config's lib dir",
+                Command::new(llvm_config).arg("--libdir"),
+            );
+            let libdir = str::from_utf8(&output.stdout).unwrap().trim_end();
+            let paths = std::fs::read_dir(Path::new(libdir).join("clang"))
+                .unwrap()
+                .map(|e| e.unwrap().path().join("lib").join(subpath));
+            match find_library(paths, &libname) {
+                Ok(p) => p,
+                Err(paths) => panic!(
+                    "failed to find llvm-config's compiler-rt: {}",
+                    paths.join(":")
+                ),
+            }
+        } else {
+            panic!("neither CLANG nor LLVM_CONFIG could be read");
+        };
+
+        let mut index = 0;
+        let mut files = HashMap::new();
+        let mut orig = ar::Archive::new(File::open(&fullpath).unwrap());
+        while let Some(entry_result) = orig.next_entry() {
+            let entry = entry_result.unwrap();
+            let name = str::from_utf8(entry.header().identifier()).unwrap();
+            files.insert(name.to_owned(), index);
+            index += 1;
+        }
+
+        let sources = sources::get_sources(llvm_target);
+        let mut new =
+            ar::Builder::new(File::create(Path::new(&out_dir).join("libcompiler-rt.a")).unwrap());
+        for (sym, _src) in sources.map.iter() {
+            let &i = {
+                let sym_ = if sym.starts_with("__") {
+                    &sym[2..]
+                } else {
+                    &sym
+                };
+                match files.get(&format!("{}.c.o", sym_)) {
+                    Some(i) => i,
+                    None => match files.get(&format!("{}.S.o", sym_)) {
+                        Some(i) => i,
+                        None => panic!("could not find expected symbol {} in {:?}", sym, &fullpath),
+                    },
+                }
+            };
+            let mut entry = orig.jump_to_entry(i).unwrap();
+            // TODO: ar really should have an append_entry to avoid the clone
+            new.append(&entry.header().clone(), &mut entry).unwrap();
+            println!("cargo:rustc-cfg={}=\"optimized-c\"", sym);
+        }
+
+        println!("cargo:rustc-link-search=native={}", out_dir);
+        println!("cargo:rustc-link-lib=static={}", "compiler-rt");
     }
 }
