@@ -49,7 +49,10 @@ unsafe fn copy_forward_misaligned_words(dest: *mut u8, src: *const u8, n: usize)
     while dest_usize < dest_end {
         src_aligned = src_aligned.add(1);
         let cur_word = *src_aligned;
+        #[cfg(target_endian = "little")]
         let resembled = prev_word >> shift | cur_word << (WORD_SIZE * 8 - shift);
+        #[cfg(target_endian = "big")]
+        let resembled = prev_word << shift | cur_word >> (WORD_SIZE * 8 - shift);
         prev_word = cur_word;
 
         *dest_usize = resembled;
@@ -125,7 +128,10 @@ unsafe fn copy_backward_misaligned_words(dest: *mut u8, src: *const u8, n: usize
     while dest_start < dest_usize {
         src_aligned = src_aligned.sub(1);
         let cur_word = *src_aligned;
+        #[cfg(target_endian = "little")]
         let resembled = prev_word << (WORD_SIZE * 8 - shift) | cur_word >> shift;
+        #[cfg(target_endian = "big")]
+        let resembled = prev_word >> (WORD_SIZE * 8 - shift) | cur_word << shift;
         prev_word = cur_word;
 
         dest_usize = dest_usize.sub(1);
