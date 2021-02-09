@@ -3,7 +3,11 @@ use core::intrinsics::likely;
 const WORD_SIZE: usize = core::mem::size_of::<usize>();
 const WORD_MASK: usize = WORD_SIZE - 1;
 
-const WORD_COPY_THRESHOLD: usize = 2 * WORD_SIZE;
+const WORD_COPY_THRESHOLD: usize = if 2 * WORD_SIZE > 16 {
+    2 * WORD_SIZE
+} else {
+    16
+};
 
 #[inline(always)]
 unsafe fn copy_forward_bytes(mut dest: *mut u8, mut src: *const u8, n: usize) {
